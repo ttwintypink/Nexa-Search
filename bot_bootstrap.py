@@ -147,7 +147,7 @@ async def diag_cmd(message: Message, command: CommandObject) -> None:
         await legacy_bot.screen(
             message.chat.id,
             message.from_user.id,
-            "<b>РќРµРґРѕСЃС‚Р°С‚РѕС‡РЅРѕ РїСЂР°РІ.</b>",
+            "<b>Access denied.</b>",
             legacy_bot.back_main_kb(),
         )
         return
