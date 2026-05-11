@@ -20,7 +20,7 @@ USERNAME_RE = re.compile(r"^[a-z][a-z0-9_]{4,31}$")
 BAD_RESERVED_PARTS = ("telegram", "support", "admin", "helpdesk")
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 NexaSearchReadOnlyPipeline/1.0"
+    "AppleWebKit/537.36 NexaSearchReadOnlyPipeline/1.1 Safari/537.36"
 )
 
 
@@ -55,6 +55,10 @@ class PipelineContext:
     mode: str
     timeouts: PipelineTimeouts
     retry_policy: RetryPolicy = RetryPolicy()
+    # True = any Fragment network/ambiguous result blocks the username.
+    # False = Fragment still skips confirmed cards/sales/auctions, but a temporary
+    # Fragment timeout does not kill the whole turbo batch.
+    fragment_required: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,7 +98,7 @@ class PipelineState:
         *,
         normalized_username: str | None = None,
         halted: bool | None = None,
-    ) -> PipelineState:
+    ) -> "PipelineState":
         return replace(
             self,
             normalized_username=(
@@ -111,10 +115,10 @@ class UsernameHandler:
     stage_name = "UsernameHandler"
     always_run = False
 
-    def __init__(self, next_handler: UsernameHandler | None = None) -> None:
+    def __init__(self, next_handler: "UsernameHandler" | None = None) -> None:
         self._next = next_handler
 
-    def set_next(self, handler: UsernameHandler) -> UsernameHandler:
+    def set_next(self, handler: "UsernameHandler") -> "UsernameHandler":
         self._next = handler
         return handler
 
@@ -173,11 +177,7 @@ class NormalizeUsernameHandler(UsernameHandler):
             http_status=None,
             latency_ms=latency_ms,
         )
-        return state.add_stage(
-            stage,
-            normalized_username=normalized,
-            halted=halted,
-        )
+        return state.add_stage(stage, normalized_username=normalized, halted=halted)
 
 
 class FragmentCheckHandler(UsernameHandler):
@@ -191,6 +191,79 @@ class FragmentCheckHandler(UsernameHandler):
         super().__init__(next_handler)
         self._http_session = http_session
 
+    @staticmethod
+    def _classify_fragment_page(username: str, status: int, final_url: str, text: str) -> tuple[StageOutcome | None, str]:
+        low = re.sub(r"\s+", " ", html.unescape(text)).lower()
+        final_url = final_url.lower()
+
+        if status in {404, 410}:
+            return StageOutcome.PASS, "fragment_not_listed"
+
+        exact_markers = (
+            f"/username/{username}",
+            f"@{username}",
+            f"{username}.t.me",
+            f">{username}<",
+            f"username/{username}",
+            f"{username}</h1",
+            f"{username}</title",
+        )
+        belongs_to_username = (
+            any(marker in low for marker in exact_markers)
+            or f"/username/{username}" in final_url
+        )
+
+        not_found_markers = (
+            "not found",
+            "page not found",
+            "username not found",
+            "no results found",
+            "nothing found",
+        )
+        if not belongs_to_username and any(marker in low for marker in not_found_markers):
+            return StageOutcome.PASS, "fragment_not_listed"
+
+        busy_markers = (
+            "for sale",
+            "on sale",
+            "listed for sale",
+            "sale price",
+            "buy now",
+            "make an offer",
+            "available",
+            "available for purchase",
+            "minimum bid",
+            "place bid",
+            "highest bid",
+            "current bid",
+            "bid history",
+            "auction",
+            "auction ends",
+            "sold for",
+            "sold",
+            "taken",
+            "unavailable",
+            "owned by",
+            "owner",
+            "ownership history",
+            "collectible username",
+            "telegram username",
+            "ton web 3.0 address",
+            "status",
+        )
+        if belongs_to_username and any(marker in low for marker in busy_markers):
+            return StageOutcome.SKIP, "fragment_collectible_or_occupied"
+
+        # Fragment can render a card without sale/auction words. Any exact username
+        # page means the name is not a normal free Telegram profile username.
+        if belongs_to_username and status == 200:
+            return StageOutcome.SKIP, "fragment_page_exists"
+
+        if 200 <= status < 500 and not belongs_to_username:
+            return StageOutcome.PASS, f"fragment_no_exact_card_http_{status}"
+
+        return None, "fragment_ambiguous_response"
+
     async def process(self, state: PipelineState) -> PipelineState:
         username = state.normalized_username or ""
         url = f"https://fragment.com/username/{username}"
@@ -199,123 +272,47 @@ class FragmentCheckHandler(UsernameHandler):
         last_status: int | None = None
         last_reason = "fragment_unverified"
 
+        headers = {
+            "User-Agent": DEFAULT_USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        }
+
         for attempt in range(1, attempts + 1):
             try:
                 timeout = aiohttp.ClientTimeout(
-                    total=state.context.timeouts.fragment_seconds
+                    total=state.context.timeouts.fragment_seconds,
+                    sock_connect=min(1.0, state.context.timeouts.fragment_seconds),
+                    sock_read=state.context.timeouts.fragment_seconds,
                 )
                 async with self._http_session.get(
                     url,
                     allow_redirects=True,
                     timeout=timeout,
-                    headers={
-                        "User-Agent": DEFAULT_USER_AGENT,
-                        "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
-                    },
+                    headers=headers,
                 ) as response:
                     last_status = response.status
                     text = await response.text(errors="ignore")
-                    final_url = str(response.url).lower()
-                    low = re.sub(r"\s+", " ", html.unescape(text)).lower()
-                    exact_markers = (
-                        f"/username/{username}",
-                        f"@{username}",
-                        f"{username}.t.me",
-                        f">{username}<",
-                        f"username/{username}",
+                    outcome, reason = self._classify_fragment_page(
+                        username,
+                        response.status,
+                        str(response.url),
+                        text,
                     )
-                    belongs_to_username = (
-                        any(marker in low for marker in exact_markers)
-                        or f"/username/{username}" in final_url
-                    )
-                    not_found_markers = (
-                        "not found",
-                        "page not found",
-                        "username not found",
-                        "no results found",
-                        "nothing found",
-                    )
-                    busy_markers = (
-                        "for sale",
-                        "on sale",
-                        "listed for sale",
-                        "sale price",
-                        "buy now",
-                        "make an offer",
-                        "available for purchase",
-                        "minimum bid",
-                        "place bid",
-                        "highest bid",
-                        "current bid",
-                        "bid history",
-                        "auction",
-                        "auction ends",
-                        "sold for",
-                        "sold",
-                        "taken",
-                        "unavailable",
-                        "owned by",
-                        "owner",
-                        "ownership history",
-                        "collectible username",
-                        "telegram username",
-                        "ton web 3.0 address",
-                    )
-                    if response.status in {404, 410}:
+                    if outcome is not None:
                         return state.add_stage(
                             StageResult(
                                 stage_name=self.stage_name,
-                                outcome=StageOutcome.PASS,
-                                reason="fragment_not_listed",
+                                outcome=outcome,
+                                reason=reason,
                                 http_status=response.status,
-                                latency_ms=int(
-                                    (time.perf_counter() - started_at) * 1000
-                                ),
-                            )
-                        )
-                    if not belongs_to_username and any(
-                        marker in low for marker in not_found_markers
-                    ):
-                        return state.add_stage(
-                            StageResult(
-                                stage_name=self.stage_name,
-                                outcome=StageOutcome.PASS,
-                                reason="fragment_not_listed",
-                                http_status=response.status,
-                                latency_ms=int(
-                                    (time.perf_counter() - started_at) * 1000
-                                ),
-                            )
-                        )
-                    if belongs_to_username and any(
-                        marker in low for marker in busy_markers
-                    ):
-                        return state.add_stage(
-                            StageResult(
-                                stage_name=self.stage_name,
-                                outcome=StageOutcome.SKIP,
-                                reason="fragment_collectible_or_occupied",
-                                http_status=response.status,
-                                latency_ms=int(
-                                    (time.perf_counter() - started_at) * 1000
-                                ),
+                                latency_ms=int((time.perf_counter() - started_at) * 1000),
                             ),
-                            halted=True,
+                            halted=(outcome is StageOutcome.SKIP),
                         )
-                    if belongs_to_username:
-                        return state.add_stage(
-                            StageResult(
-                                stage_name=self.stage_name,
-                                outcome=StageOutcome.SKIP,
-                                reason="fragment_page_exists",
-                                http_status=response.status,
-                                latency_ms=int(
-                                    (time.perf_counter() - started_at) * 1000
-                                ),
-                            ),
-                            halted=True,
-                        )
-                    last_reason = "fragment_ambiguous_response"
+                    last_reason = reason
             except asyncio.TimeoutError:
                 last_reason = "fragment_timeout"
             except aiohttp.ClientError:
@@ -326,15 +323,28 @@ class FragmentCheckHandler(UsernameHandler):
             if attempt < attempts and state.context.retry_policy.delay_seconds > 0:
                 await asyncio.sleep(state.context.retry_policy.delay_seconds)
 
+        latency_ms = int((time.perf_counter() - started_at) * 1000)
+        if state.context.fragment_required:
+            return state.add_stage(
+                StageResult(
+                    stage_name=self.stage_name,
+                    outcome=StageOutcome.ERROR,
+                    reason=last_reason,
+                    http_status=last_status,
+                    latency_ms=latency_ms,
+                ),
+                halted=True,
+            )
+
         return state.add_stage(
             StageResult(
                 stage_name=self.stage_name,
-                outcome=StageOutcome.ERROR,
-                reason=last_reason,
+                outcome=StageOutcome.PASS,
+                reason=f"{last_reason}_soft_pass",
                 http_status=last_status,
-                latency_ms=int((time.perf_counter() - started_at) * 1000),
+                latency_ms=latency_ms,
             ),
-            halted=True,
+            halted=False,
         )
 
 
@@ -367,9 +377,7 @@ class TelegramBotApiCheckHandler(UsernameHandler):
                         outcome=StageOutcome.SKIP,
                         reason="telegram_chat_exists",
                         http_status=200,
-                        latency_ms=int(
-                            (time.perf_counter() - started_at) * 1000
-                        ),
+                        latency_ms=int((time.perf_counter() - started_at) * 1000),
                     ),
                     halted=True,
                 )
@@ -382,9 +390,7 @@ class TelegramBotApiCheckHandler(UsernameHandler):
                             outcome=StageOutcome.PASS,
                             reason="telegram_not_found",
                             http_status=400,
-                            latency_ms=int(
-                                (time.perf_counter() - started_at) * 1000
-                            ),
+                            latency_ms=int((time.perf_counter() - started_at) * 1000),
                         )
                     )
                 if (
@@ -400,9 +406,7 @@ class TelegramBotApiCheckHandler(UsernameHandler):
                             outcome=StageOutcome.SKIP,
                             reason="telegram_invalid_or_forbidden",
                             http_status=400,
-                            latency_ms=int(
-                                (time.perf_counter() - started_at) * 1000
-                            ),
+                            latency_ms=int((time.perf_counter() - started_at) * 1000),
                         ),
                         halted=True,
                     )
@@ -486,11 +490,7 @@ class ResultDecisionHandler(UsernameHandler):
 
 
 class UsernameAvailabilityPipeline:
-    def __init__(
-        self,
-        bot: Bot,
-        http_session: aiohttp.ClientSession,
-    ) -> None:
+    def __init__(self, bot: Bot, http_session: aiohttp.ClientSession) -> None:
         self._entrypoint = NormalizeUsernameHandler()
         fragment = self._entrypoint.set_next(FragmentCheckHandler(http_session))
         telegram = fragment.set_next(TelegramBotApiCheckHandler(bot))
@@ -499,7 +499,8 @@ class UsernameAvailabilityPipeline:
     async def run(self, context: PipelineContext) -> PipelineResult:
         print(
             f"[task:init] username={context.username_raw} "
-            f"mode={context.mode} strict={context.strict}"
+            f"mode={context.mode} strict={context.strict} "
+            f"fragment_required={context.fragment_required}"
         )
         initial_state = PipelineState(context=context)
         try:
